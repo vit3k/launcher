@@ -10,6 +10,8 @@ use eframe::egui;
 use steam::SteamGame;
 
 fn main() {
+    let windowed = std::env::args().any(|a| a == "--windowed");
+
     let game_input = Arc::new(match gameinput::GameInputHandle::init() {
         Ok(handle) => handle,
         Err(hr) => {
@@ -18,15 +20,28 @@ fn main() {
         }
     });
 
+    let viewport = if windowed {
+        egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 720.0])
+            .with_decorations(true)
+    } else {
+        egui::ViewportBuilder::default().with_decorations(false)
+    };
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_decorations(false),
+        viewport,
         ..Default::default()
     };
 
     eframe::run_native(
         "Launcher",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(LauncherApp::new(Arc::clone(&game_input))))),
+        Box::new(move |_cc| {
+            Ok(Box::new(LauncherApp::new(
+                Arc::clone(&game_input),
+                windowed,
+            )))
+        }),
     )
     .unwrap_or_else(|e| eprintln!("eframe error: {e}"));
 }
@@ -47,6 +62,7 @@ struct PendingAction {
     select_steam: Option<usize>,
     select_window: Option<usize>,
     switch_panel: Option<Panel>,
+    resume_window_pid: Option<u32>,
 }
 
 struct LauncherApp {
@@ -56,9 +72,12 @@ struct LauncherApp {
     visible: bool,
     shown_at: Option<Instant>,
     initialized: bool,
+    windowed: bool,
     active_panel: Panel,
     selected_steam: usize,
     selected_window: usize,
+    scroll_to_steam: bool,
+    scroll_to_window: bool,
     /// PID of the process that was suspended when we opened the launcher.
     /// Resumed when we hide.
     suspended_pid: Option<u32>,
@@ -67,21 +86,26 @@ struct LauncherApp {
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
 impl LauncherApp {
-    fn new(game_input: Arc<gameinput::GameInputHandle>) -> Self {
+    fn new(game_input: Arc<gameinput::GameInputHandle>, windowed: bool) -> Self {
         game_input.drain_guide_presses();
         game_input.drain_combo_presses();
-        Self {
+        let mut app = Self {
             game_input,
             windows: Vec::new(),
             steam_games: Vec::new(),
-            visible: false,
-            shown_at: None,
+            visible: windowed,
+            shown_at: if windowed { Some(Instant::now()) } else { None },
             initialized: false,
+            windowed,
             active_panel: Panel::Steam,
             selected_steam: 0,
             selected_window: 0,
+            scroll_to_steam: false,
+            scroll_to_window: false,
             suspended_pid: None,
-        }
+        };
+        app.refresh();
+        app
     }
 
     fn refresh(&mut self) {
@@ -114,7 +138,9 @@ impl LauncherApp {
         self.visible = true;
         self.shown_at = Some(Instant::now());
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        if !self.windowed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
@@ -122,7 +148,9 @@ impl LauncherApp {
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         self.shown_at = None;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        if !self.windowed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
 
         if let Some(pid) = self.suspended_pid.take() {
@@ -150,7 +178,8 @@ impl LauncherApp {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // On the very first frame, minimize before anything is painted.
+        // On the very first frame, register the repaint callback and (unless
+        // in windowed mode) minimize before anything is painted.
         if !self.initialized {
             self.initialized = true;
             let ctx_clone = ctx.clone();
@@ -158,9 +187,11 @@ impl eframe::App for LauncherApp {
                 .set_repaint_callback(std::sync::Arc::new(move || {
                     ctx_clone.request_repaint();
                 }));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            ctx.request_repaint();
-            return;
+            if !self.windowed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                ctx.request_repaint();
+                return;
+            }
         }
 
         // ── Gamepad input ────────────────────────────────────────────────
@@ -190,6 +221,15 @@ impl eframe::App for LauncherApp {
         // Always repaint so combo/D-pad presses are never missed.
         ctx.request_repaint();
 
+        // If the window was restored externally (e.g. clicking the taskbar)
+        // while visible=false, sync up so we don't render a black screen.
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !is_minimized && !self.visible {
+            self.visible = true;
+            self.shown_at = Some(Instant::now());
+            self.refresh();
+        }
+
         if !self.visible {
             return;
         }
@@ -205,17 +245,21 @@ impl eframe::App for LauncherApp {
             Panel::Steam if !self.steam_games.is_empty() => {
                 if pad.dpad_up > 0 && self.selected_steam > 0 {
                     self.selected_steam -= 1;
+                    self.scroll_to_steam = true;
                 }
                 if pad.dpad_down > 0 && self.selected_steam + 1 < self.steam_games.len() {
                     self.selected_steam += 1;
+                    self.scroll_to_steam = true;
                 }
             }
             Panel::Windows if !self.windows.is_empty() => {
                 if pad.dpad_up > 0 && self.selected_window > 0 {
                     self.selected_window -= 1;
+                    self.scroll_to_window = true;
                 }
                 if pad.dpad_down > 0 && self.selected_window + 1 < self.windows.len() {
                     self.selected_window += 1;
+                    self.scroll_to_window = true;
                 }
             }
             _ => {}
@@ -240,11 +284,13 @@ impl eframe::App for LauncherApp {
             Panel::Steam if !self.steam_games.is_empty() => {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && self.selected_steam > 0 {
                     self.selected_steam -= 1;
+                    self.scroll_to_steam = true;
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
                     && self.selected_steam + 1 < self.steam_games.len()
                 {
                     self.selected_steam += 1;
+                    self.scroll_to_steam = true;
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let idx = self.selected_steam;
@@ -256,11 +302,13 @@ impl eframe::App for LauncherApp {
             Panel::Windows if !self.windows.is_empty() => {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && self.selected_window > 0 {
                     self.selected_window -= 1;
+                    self.scroll_to_window = true;
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
                     && self.selected_window + 1 < self.windows.len()
                 {
                     self.selected_window += 1;
+                    self.scroll_to_window = true;
                 }
             }
             _ => {}
@@ -312,6 +360,10 @@ impl eframe::App for LauncherApp {
             let selected_steam = self.selected_steam;
             let selected_window = self.selected_window;
             let suspended_pid = self.suspended_pid;
+            let scroll_to_steam = self.scroll_to_steam;
+            let scroll_to_window = self.scroll_to_window;
+            self.scroll_to_steam = false;
+            self.scroll_to_window = false;
 
             let total_w = ui.available_width();
             let total_h = ui.available_height();
@@ -359,62 +411,71 @@ impl eframe::App for LauncherApp {
                                         let is_selected = !steam_focused && i == selected_window;
                                         let is_suspended = suspended_pid == Some(app.pid);
 
-                                        let row = ui.group(|ui| {
+                                        let mut switch_clicked = false;
+                                        let inner = ui.vertical(|ui| {
                                             ui.set_min_width(ui.available_width());
-
-                                            if is_selected {
-                                                let rect = ui.max_rect();
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    4.0,
-                                                    accent.gamma_multiply(0.25),
-                                                );
-                                            }
-
                                             ui.horizontal(|ui| {
-                                                if is_selected {
-                                                    ui.label(
-                                                        egui::RichText::new("▶").color(accent),
-                                                    );
-                                                } else {
-                                                    ui.label("  ");
-                                                }
-
                                                 if is_suspended {
                                                     ui.label(
-                                                        egui::RichText::new("⏸")
+                                                        egui::RichText::new("⏸ ")
                                                             .color(suspended_colour),
                                                     );
                                                 }
-
-                                                let name_colour = if is_suspended {
-                                                    suspended_colour
-                                                } else if is_selected {
-                                                    accent
-                                                } else {
-                                                    ui.visuals().text_color()
-                                                };
                                                 ui.label(
-                                                    egui::RichText::new(&app.name)
-                                                        .strong()
-                                                        .color(name_colour),
+                                                    egui::RichText::new(&app.name).strong().color(
+                                                        if is_suspended {
+                                                            suspended_colour
+                                                        } else {
+                                                            ui.visuals().text_color()
+                                                        },
+                                                    ),
                                                 );
                                             });
-
                                             if !app.path.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(&app.path).small().weak(),
                                                 );
                                             }
+                                            if is_selected {
+                                                let btn_label = if is_suspended {
+                                                    "▶ Resume & Switch"
+                                                } else {
+                                                    "⇱ Switch To"
+                                                };
+                                                if ui.button(btn_label).clicked() {
+                                                    switch_clicked = true;
+                                                }
+                                            }
                                         });
 
+                                        let row_rect = inner.response.rect;
                                         if is_selected {
-                                            row.response.scroll_to_me(Some(egui::Align::Center));
+                                            ui.painter().rect_filled(
+                                                row_rect,
+                                                2.0,
+                                                accent.gamma_multiply(0.2),
+                                            );
                                         }
+                                        let row_interact = ui.interact(
+                                            row_rect,
+                                            ui.id().with(("win_row", i)),
+                                            egui::Sense::click(),
+                                        );
 
-                                        if row.response.clicked() {
+                                        if switch_clicked {
+                                            action.resume_window_pid = Some(app.pid);
+                                            action.hide = true;
+                                        } else if row_interact.clicked() {
                                             action.select_window = Some(i);
                                             action.switch_panel = Some(Panel::Windows);
+                                        } else if row_interact.double_clicked() {
+                                            action.select_window = Some(i);
+                                            action.switch_panel = Some(Panel::Windows);
+                                            action.resume_window_pid = Some(app.pid);
+                                            action.hide = true;
+                                        }
+                                        if is_selected && scroll_to_window {
+                                            row_interact.scroll_to_me(Some(egui::Align::Center));
                                         }
                                     }
                                 });
@@ -459,59 +520,54 @@ impl eframe::App for LauncherApp {
                                     for (i, game) in self.steam_games.iter().enumerate() {
                                         let is_selected = steam_focused && i == selected_steam;
 
-                                        let row = ui.group(|ui| {
+                                        let mut launch_clicked = false;
+
+                                        let inner = ui.vertical(|ui| {
                                             ui.set_min_width(ui.available_width());
-
-                                            if is_selected {
-                                                let rect = ui.max_rect();
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    4.0,
-                                                    accent.gamma_multiply(0.25),
-                                                );
-                                            }
-
-                                            ui.horizontal(|ui| {
-                                                if is_selected {
-                                                    ui.label(
-                                                        egui::RichText::new("▶").color(accent),
-                                                    );
-                                                } else {
-                                                    ui.label("  ");
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(&game.name).strong().color(
-                                                        if is_selected {
-                                                            accent
-                                                        } else {
-                                                            ui.visuals().text_color()
-                                                        },
-                                                    ),
-                                                );
-                                            });
-
+                                            ui.label(egui::RichText::new(&game.name).strong());
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "  {} · {}",
+                                                    "{} · {}",
                                                     game.appid, game.install_dir
                                                 ))
                                                 .small()
                                                 .weak(),
                                             );
+                                            if is_selected {
+                                                if ui.button("▶ Launch").clicked() {
+                                                    launch_clicked = true;
+                                                }
+                                            }
                                         });
 
+                                        let row_rect = inner.response.rect;
                                         if is_selected {
-                                            row.response.scroll_to_me(Some(egui::Align::Center));
+                                            ui.painter().rect_filled(
+                                                row_rect,
+                                                2.0,
+                                                accent.gamma_multiply(0.2),
+                                            );
                                         }
+                                        let row_interact = ui.interact(
+                                            row_rect,
+                                            ui.id().with(("steam_row", i)),
+                                            egui::Sense::click(),
+                                        );
 
-                                        if row.response.clicked() {
-                                            action.select_steam = Some(i);
-                                            action.switch_panel = Some(Panel::Steam);
-                                        }
-                                        if row.response.double_clicked() {
+                                        if launch_clicked {
                                             action.select_steam = Some(i);
                                             action.launch_steam_idx = Some(i);
                                             action.hide = true;
+                                        } else if row_interact.clicked() {
+                                            action.select_steam = Some(i);
+                                            action.switch_panel = Some(Panel::Steam);
+                                        } else if row_interact.double_clicked() {
+                                            action.select_steam = Some(i);
+                                            action.launch_steam_idx = Some(i);
+                                            action.hide = true;
+                                        }
+                                        if is_selected && scroll_to_steam {
+                                            row_interact.scroll_to_me(Some(egui::Align::Center));
                                         }
                                     }
                                 });
@@ -532,6 +588,16 @@ impl eframe::App for LauncherApp {
         }
         if let Some(i) = action.select_window {
             self.selected_window = i;
+        }
+        if let Some(pid) = action.resume_window_pid {
+            // If this is the suspended process, clear it so hide() doesn't
+            // resume it again — we handle it explicitly here.
+            if self.suspended_pid == Some(pid) {
+                self.suspended_pid = None;
+            }
+            if let Err(e) = process::resume_process_by_pid_and_restore(pid) {
+                eprintln!("resume pid {pid} failed: {e:?}");
+            }
         }
         if let Some(idx) = action.launch_steam_idx {
             self.launch_steam_game(idx);
