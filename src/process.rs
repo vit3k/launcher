@@ -15,8 +15,8 @@ use windows::Win32::System::Threading::{
     OpenThread, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SW_MINIMIZE,
-    SW_RESTORE, ShowWindow,
+    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    SW_MINIMIZE, SW_RESTORE, ShowWindow,
 };
 use windows::core::PCSTR;
 
@@ -35,6 +35,26 @@ pub struct AppDetail {
     pub name: String,
     pub state: String,
     pub path: String,
+}
+
+/// A running window with its cached suspension state.
+pub struct WindowEntry {
+    pub info: AppInfo,
+    pub suspended: bool,
+}
+
+/// Returns the PID of the process that owns the current foreground window,
+/// or `None` if there is no foreground window (e.g. the desktop).
+pub fn get_foreground_pid() -> Option<u32> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0 == std::ptr::null_mut() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 { None } else { Some(pid) }
+    }
 }
 
 pub fn get_process_path(pid: u32) -> String {
@@ -81,6 +101,17 @@ pub fn get_all_windows() -> Vec<AppInfo> {
         let _ = EnumWindows(Some(enum_windows_proc), LPARAM(apps_ptr));
     }
     apps
+}
+
+/// Build the full list of visible windows, checking each process's suspension state.
+pub fn get_all_window_entries() -> Vec<WindowEntry> {
+    get_all_windows()
+        .into_iter()
+        .map(|info| {
+            let suspended = is_process_suspended(info.pid).unwrap_or(false);
+            WindowEntry { info, suspended }
+        })
+        .collect()
 }
 
 pub fn find_window_by_pid(target_pid: u32) -> Option<HWND> {
