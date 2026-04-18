@@ -1,12 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 pub mod gameinput;
+pub mod epic;
+pub mod gog;
 pub mod process;
 pub mod steam;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use epic::EpicGame;
 use eframe::egui;
+use gog::GogGame;
 use steam::SteamGame;
 
 fn main() {
@@ -58,7 +62,7 @@ enum Panel {
 struct PendingAction {
     hide: bool,
     refresh: bool,
-    launch_steam_idx: Option<usize>,
+    launch_library_idx: Option<usize>,
     select_steam: Option<usize>,
     select_window: Option<usize>,
     switch_panel: Option<Panel>,
@@ -69,6 +73,8 @@ struct LauncherApp {
     game_input: Arc<gameinput::GameInputHandle>,
     windows: Vec<process::AppInfo>,
     steam_games: Vec<SteamGame>,
+    epic_games: Vec<EpicGame>,
+    gog_games: Vec<GogGame>,
     visible: bool,
     shown_at: Option<Instant>,
     initialized: bool,
@@ -93,6 +99,8 @@ impl LauncherApp {
             game_input,
             windows: Vec::new(),
             steam_games: Vec::new(),
+            epic_games: Vec::new(),
+            gog_games: Vec::new(),
             visible: windowed,
             shown_at: if windowed { Some(Instant::now()) } else { None },
             initialized: false,
@@ -111,12 +119,19 @@ impl LauncherApp {
     fn refresh(&mut self) {
         self.windows = process::get_all_windows();
         self.steam_games = steam::get_steam_games_from_manifests();
+        self.epic_games = epic::get_installed_epic_games();
+        self.gog_games = gog::get_installed_gog_games();
+        let library_len = self.library_len();
         self.selected_steam = self
             .selected_steam
-            .min(self.steam_games.len().saturating_sub(1));
+            .min(library_len.saturating_sub(1));
         self.selected_window = self
             .selected_window
             .min(self.windows.len().saturating_sub(1));
+    }
+
+    fn library_len(&self) -> usize {
+        self.steam_games.len() + self.epic_games.len() + self.gog_games.len()
     }
 
     /// Grab the foreground PID *before* we steal focus, suspend that process,
@@ -166,12 +181,30 @@ impl LauncherApp {
             .unwrap_or(true)
     }
 
-    fn launch_steam_game(&self, idx: usize) {
+    fn launch_library_game(&self, idx: usize) {
+        let steam_len = self.steam_games.len();
         if let Some(game) = self.steam_games.get(idx) {
             let url = format!("steam://rungameid/{}", game.appid);
             let _ = std::process::Command::new("cmd")
                 .args(["/c", "start", "", &url])
                 .spawn();
+            return;
+        }
+
+        let epic_len = self.epic_games.len();
+        let epic_idx = idx.saturating_sub(steam_len);
+        if let Some(game) = self.epic_games.get(epic_idx) {
+            if let Err(e) = epic::launch_epic_game(game) {
+                eprintln!("epic launch failed ({}): {e}", game.display_name);
+            }
+            return;
+        }
+
+        let gog_idx = idx.saturating_sub(steam_len + epic_len);
+        if let Some(game) = self.gog_games.get(gog_idx) {
+            if let Err(e) = gog::launch_gog_game(game) {
+                eprintln!("gog launch failed ({}): {e}", game.display_name);
+            }
         }
     }
 }
@@ -242,12 +275,12 @@ impl eframe::App for LauncherApp {
         }
 
         match self.active_panel {
-            Panel::Steam if !self.steam_games.is_empty() => {
+            Panel::Steam if self.library_len() > 0 => {
                 if pad.dpad_up > 0 && self.selected_steam > 0 {
                     self.selected_steam -= 1;
                     self.scroll_to_steam = true;
                 }
-                if pad.dpad_down > 0 && self.selected_steam + 1 < self.steam_games.len() {
+                if pad.dpad_down > 0 && self.selected_steam + 1 < self.library_len() {
                     self.selected_steam += 1;
                     self.scroll_to_steam = true;
                 }
@@ -267,7 +300,7 @@ impl eframe::App for LauncherApp {
 
         if pad.a > 0 && self.active_panel == Panel::Steam {
             let idx = self.selected_steam;
-            self.launch_steam_game(idx);
+            self.launch_library_game(idx);
             self.hide(ctx);
             return;
         }
@@ -281,20 +314,20 @@ impl eframe::App for LauncherApp {
         }
 
         match self.active_panel {
-            Panel::Steam if !self.steam_games.is_empty() => {
+            Panel::Steam if self.library_len() > 0 => {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && self.selected_steam > 0 {
                     self.selected_steam -= 1;
                     self.scroll_to_steam = true;
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
-                    && self.selected_steam + 1 < self.steam_games.len()
+                    && self.selected_steam + 1 < self.library_len()
                 {
                     self.selected_steam += 1;
                     self.scroll_to_steam = true;
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let idx = self.selected_steam;
-                    self.launch_steam_game(idx);
+                    self.launch_library_game(idx);
                     self.hide(ctx);
                     return;
                 }
@@ -489,15 +522,15 @@ impl eframe::App for LauncherApp {
                     ui.horizontal(|ui| {
                         if steam_focused {
                             ui.label(
-                                egui::RichText::new("▶ Steam Library")
+                                egui::RichText::new("▶ Library")
                                     .strong()
                                     .color(accent),
                             );
                         } else {
-                            ui.strong("Steam Library");
+                            ui.strong("Library");
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.weak(format!("{} games", self.steam_games.len()));
+                            ui.weak(format!("{} games", self.library_len()));
                         });
                     });
 
@@ -517,22 +550,85 @@ impl eframe::App for LauncherApp {
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     ui.set_width(col_w - 16.0);
-                                    for (i, game) in self.steam_games.iter().enumerate() {
+                                    for i in 0..self.library_len() {
                                         let is_selected = steam_focused && i == selected_steam;
+                                        let steam_len = self.steam_games.len();
+                                        let epic_len = self.epic_games.len();
+                                        let is_steam = i < steam_len;
+                                        let is_epic = i >= steam_len && i < steam_len + epic_len;
 
                                         let mut launch_clicked = false;
 
                                         let inner = ui.vertical(|ui| {
                                             ui.set_min_width(ui.available_width());
-                                            ui.label(egui::RichText::new(&game.name).strong());
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} · {}",
-                                                    game.appid, game.install_dir
-                                                ))
-                                                .small()
-                                                .weak(),
-                                            );
+                                            if is_steam {
+                                                let game = &self.steam_games[i];
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("STEAM")
+                                                            .small()
+                                                            .strong()
+                                                            .color(egui::Color32::from_rgb(25, 35, 55))
+                                                            .background_color(egui::Color32::from_rgb(125, 170, 235)),
+                                                    );
+                                                    ui.label(egui::RichText::new(&game.name).strong());
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Steam · {} · {}",
+                                                        game.appid, game.install_dir
+                                                    ))
+                                                    .small()
+                                                    .weak(),
+                                                );
+                                            } else if is_epic {
+                                                let epic_idx = i - steam_len;
+                                                let game = &self.epic_games[epic_idx];
+                                                let title = if game.display_name.is_empty() {
+                                                    &game.app_name
+                                                } else {
+                                                    &game.display_name
+                                                };
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("EPIC")
+                                                            .small()
+                                                            .strong()
+                                                            .color(egui::Color32::from_rgb(245, 245, 245))
+                                                            .background_color(egui::Color32::from_rgb(45, 45, 45)),
+                                                    );
+                                                    ui.label(egui::RichText::new(title).strong());
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Epic · {} · {}",
+                                                        game.app_name, game.install_location
+                                                    ))
+                                                    .small()
+                                                    .weak(),
+                                                );
+                                            } else {
+                                                let gog_idx = i - steam_len - epic_len;
+                                                let game = &self.gog_games[gog_idx];
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("GOG")
+                                                            .small()
+                                                            .strong()
+                                                            .color(egui::Color32::from_rgb(250, 240, 220))
+                                                            .background_color(egui::Color32::from_rgb(95, 55, 25)),
+                                                    );
+                                                    ui.label(egui::RichText::new(&game.display_name).strong());
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "GOG · {}",
+                                                        game.install_location
+                                                    ))
+                                                    .small()
+                                                    .weak(),
+                                                );
+                                            }
                                             if is_selected {
                                                 if ui.button("▶ Launch").clicked() {
                                                     launch_clicked = true;
@@ -556,14 +652,14 @@ impl eframe::App for LauncherApp {
 
                                         if launch_clicked {
                                             action.select_steam = Some(i);
-                                            action.launch_steam_idx = Some(i);
+                                            action.launch_library_idx = Some(i);
                                             action.hide = true;
                                         } else if row_interact.clicked() {
                                             action.select_steam = Some(i);
                                             action.switch_panel = Some(Panel::Steam);
                                         } else if row_interact.double_clicked() {
                                             action.select_steam = Some(i);
-                                            action.launch_steam_idx = Some(i);
+                                            action.launch_library_idx = Some(i);
                                             action.hide = true;
                                         }
                                         if is_selected && scroll_to_steam {
@@ -599,8 +695,8 @@ impl eframe::App for LauncherApp {
                 eprintln!("resume pid {pid} failed: {e:?}");
             }
         }
-        if let Some(idx) = action.launch_steam_idx {
-            self.launch_steam_game(idx);
+        if let Some(idx) = action.launch_library_idx {
+            self.launch_library_game(idx);
         }
         if action.hide {
             self.hide(ctx);
