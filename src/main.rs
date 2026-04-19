@@ -4,6 +4,7 @@ pub mod epic;
 pub mod gog;
 pub mod process;
 pub mod steam;
+pub mod webserver;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +16,8 @@ use steam::SteamGame;
 
 fn main() {
     let windowed = std::env::args().any(|a| a == "--windowed");
+
+    webserver::start();
 
     let game_input = Arc::new(match gameinput::GameInputHandle::init() {
         Ok(handle) => handle,
