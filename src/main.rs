@@ -6,18 +6,20 @@ pub mod process;
 pub mod steam;
 pub mod webserver;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epic::EpicGame;
 use eframe::egui;
 use gog::GogGame;
 use steam::SteamGame;
+use webserver::{GamesPayload, SharedGames};
 
 fn main() {
     let windowed = std::env::args().any(|a| a == "--windowed");
 
-    webserver::start();
+    let shared_games: SharedGames = Arc::new(Mutex::new(GamesPayload::default()));
+    webserver::start(Arc::clone(&shared_games));
 
     let game_input = Arc::new(match gameinput::GameInputHandle::init() {
         Ok(handle) => handle,
@@ -46,6 +48,7 @@ fn main() {
         Box::new(move |_cc| {
             Ok(Box::new(LauncherApp::new(
                 Arc::clone(&game_input),
+                shared_games,
                 windowed,
             )))
         }),
@@ -74,6 +77,7 @@ struct PendingAction {
 
 struct LauncherApp {
     game_input: Arc<gameinput::GameInputHandle>,
+    shared_games: SharedGames,
     windows: Vec<process::AppInfo>,
     steam_games: Vec<SteamGame>,
     epic_games: Vec<EpicGame>,
@@ -95,11 +99,12 @@ struct LauncherApp {
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
 impl LauncherApp {
-    fn new(game_input: Arc<gameinput::GameInputHandle>, windowed: bool) -> Self {
+    fn new(game_input: Arc<gameinput::GameInputHandle>, shared_games: SharedGames, windowed: bool) -> Self {
         game_input.drain_guide_presses();
         game_input.drain_combo_presses();
         let mut app = Self {
             game_input,
+            shared_games,
             windows: Vec::new(),
             steam_games: Vec::new(),
             epic_games: Vec::new(),
@@ -131,6 +136,11 @@ impl LauncherApp {
         self.selected_window = self
             .selected_window
             .min(self.windows.len().saturating_sub(1));
+        if let Ok(mut g) = self.shared_games.lock() {
+            g.steam = self.steam_games.clone();
+            g.epic = self.epic_games.clone();
+            g.gog = self.gog_games.clone();
+        }
     }
 
     fn library_len(&self) -> usize {

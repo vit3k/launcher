@@ -1,0 +1,14 @@
+GET http://localhost:7878/games
+
+###
+
+POST http://localhost:7878/games/launch
+Content-Type: application/json
+
+{
+    "source": "steam",
+    "id": "2536520"
+}
+
+###
+GET http://localhost:7878/games/running

@@ -12,6 +12,14 @@ pub struct GogGame {
     pub source_key: String,
 }
 
+#[derive(Serialize, Debug, Clone)]
+pub struct RunningGogGame {
+    pub display_name: String,
+    pub source_key: String,
+    pub pid: u32,
+    pub exe_path: String,
+}
+
 pub fn get_installed_gog_games() -> Vec<GogGame> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -253,4 +261,28 @@ fn is_executable_path(path: &str) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("exe"))
         .unwrap_or(false)
+}
+
+pub fn get_running_gog_games() -> Vec<RunningGogGame> {
+    let games = get_installed_gog_games();
+    let mut running = Vec::new();
+    let mut apps = crate::process::get_all_windows();
+    for app in apps.drain(..) {
+        let exe_lower = app.path.to_ascii_lowercase();
+        for game in &games {
+            if game.install_location.is_empty() {
+                continue;
+            }
+            if exe_lower.contains(&game.install_location.to_ascii_lowercase()) {
+                running.push(RunningGogGame {
+                    display_name: game.display_name.clone(),
+                    source_key: game.source_key.clone(),
+                    pid: app.pid,
+                    exe_path: app.path.clone(),
+                });
+                break;
+            }
+        }
+    }
+    running
 }

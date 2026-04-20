@@ -13,6 +13,14 @@ pub struct EpicGame {
     pub manifest_path: String,
 }
 
+#[derive(Serialize, Debug, Clone)]
+pub struct RunningEpicGame {
+    pub app_name: String,
+    pub display_name: String,
+    pub pid: u32,
+    pub exe_path: String,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
 struct EpicManifest {
@@ -124,4 +132,28 @@ fn is_epic_manifest_file(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("item"))
         .unwrap_or(false)
+}
+
+pub fn get_running_epic_games() -> Vec<RunningEpicGame> {
+    let games = get_installed_epic_games();
+    let mut running = Vec::new();
+    let mut apps = crate::process::get_all_windows();
+    for app in apps.drain(..) {
+        let exe_lower = app.path.to_ascii_lowercase();
+        for game in &games {
+            if game.install_location.is_empty() {
+                continue;
+            }
+            if exe_lower.contains(&game.install_location.to_ascii_lowercase()) {
+                running.push(RunningEpicGame {
+                    app_name: game.app_name.clone(),
+                    display_name: game.display_name.clone(),
+                    pid: app.pid,
+                    exe_path: app.path.clone(),
+                });
+                break;
+            }
+        }
+    }
+    running
 }
