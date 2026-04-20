@@ -6,8 +6,8 @@ POST http://localhost:7878/games/launch
 Content-Type: application/json
 
 {
-    "source": "steam",
-    "id": "2536520"
+    "source": "gog",
+    "id": "HKLM\\1207658995_is1"
 }
 
 ###
