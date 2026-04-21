@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SW_MINIMIZE, SW_RESTORE, ShowWindow,
+    SW_MINIMIZE, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 use windows::core::PCSTR;
 
@@ -245,4 +245,16 @@ pub fn resume_process_by_pid_and_restore(pid: u32) -> windows::core::Result<()> 
         }
     }
     Ok(())
+}
+
+pub fn focus_window_by_pid(pid: u32) -> windows::core::Result<()> {
+    if let Some(hwnd) = find_window_by_pid(pid) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_win32())
+    }
 }

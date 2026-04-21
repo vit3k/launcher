@@ -5,9 +5,6 @@ use tiny_http::{Header, Response, Server};
 use crate::epic::EpicGame;
 use crate::gog::GogGame;
 use crate::steam::SteamGame;
-use crate::steam::RunningSteamGame;
-use crate::epic::RunningEpicGame;
-use crate::gog::RunningGogGame;
 
 const BIND_ADDR: &str = "0.0.0.0:7878";
 
@@ -19,10 +16,19 @@ pub struct GamesPayload {
 }
 
 #[derive(serde::Serialize)]
-struct RunningGamesPayload {
-    steam: Vec<RunningSteamGame>,
-    epic: Vec<RunningEpicGame>,
-    gog: Vec<RunningGogGame>,
+struct ApiGame {
+    id: String,
+    source: &'static str,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct ApiRunningGame {
+    id: String,
+    source: &'static str,
+    name: String,
+    pid: u32,
+    exe_path: String,
 }
 
 pub type SharedGames = Arc<Mutex<GamesPayload>>;
@@ -51,6 +57,7 @@ fn run(shared_games: SharedGames) {
             ("GET", "/suspend") | ("POST", "/suspend") => handle_suspend(request),
             ("GET", "/games") => handle_games(request, &shared_games),
             ("GET", "/games/running") => handle_running_games(request),
+            ("GET", "/windows") => handle_windows(request),
             ("POST", "/games/launch") => handle_launch(request, &shared_games),
             _ => {
                 let _ = request.respond(Response::from_string("Not Found").with_status_code(404));
@@ -95,8 +102,94 @@ fn put_system_to_sleep() {
 
 #[derive(serde::Deserialize)]
 struct LaunchRequest {
-    source: String,
     id: String,
+}
+
+fn steam_game_id(game: &SteamGame) -> String {
+    game.appid.clone()
+}
+
+fn epic_game_id(game: &EpicGame) -> String {
+    if !game.app_name.is_empty() {
+        game.app_name.clone()
+    } else {
+        format!("manifest:{}", game.manifest_path)
+    }
+}
+
+fn gog_game_id(game: &GogGame) -> String {
+    game.source_key.clone()
+}
+
+fn build_games_list(payload: &GamesPayload) -> Vec<ApiGame> {
+    let mut out = Vec::new();
+
+    for g in &payload.steam {
+        out.push(ApiGame {
+            id: steam_game_id(g),
+            source: "steam",
+            name: g.name.clone(),
+        });
+    }
+
+    for g in &payload.epic {
+        out.push(ApiGame {
+            id: epic_game_id(g),
+            source: "epic",
+            name: g.display_name.clone(),
+        });
+    }
+
+    for g in &payload.gog {
+        out.push(ApiGame {
+            id: gog_game_id(g),
+            source: "gog",
+            name: g.display_name.clone(),
+        });
+    }
+
+    out
+}
+
+fn build_running_games_list() -> Vec<ApiRunningGame> {
+    let mut out = Vec::new();
+
+    for g in crate::steam::get_running_steam_games() {
+        out.push(ApiRunningGame {
+            id: g.appid,
+            source: "steam",
+            name: g.name,
+            pid: g.pid,
+            exe_path: g.exe_path,
+        });
+    }
+
+    for g in crate::epic::get_running_epic_games() {
+        let id = if !g.app_name.is_empty() {
+            g.app_name
+        } else {
+            format!("pid:{}", g.pid)
+        };
+        out.push(ApiRunningGame {
+            id,
+            source: "epic",
+            name: g.display_name,
+            pid: g.pid,
+            exe_path: g.exe_path,
+        });
+    }
+
+    for g in crate::gog::get_running_gog_games() {
+        out.push(ApiRunningGame {
+            id: g.source_key,
+            source: "gog",
+            name: g.display_name,
+            pid: g.pid,
+            exe_path: g.exe_path,
+        });
+    }
+
+    out
 }
 
 fn handle_launch(mut request: tiny_http::Request, shared_games: &SharedGames) {
@@ -109,7 +202,7 @@ fn handle_launch(mut request: tiny_http::Request, shared_games: &SharedGames) {
         Ok(r) => r,
         Err(_) => {
             let _ = request.respond(
-                Response::from_string(r#"{"error":"invalid JSON body, expected {\"source\":\"steam|epic|gog\",\"id\":\"...\"}"}"}"#)
+                Response::from_string(r#"{"error":"invalid JSON body, expected {\"id\":\"...\"}"}"#)
                     .with_status_code(400),
             );
             return;
@@ -117,34 +210,52 @@ fn handle_launch(mut request: tiny_http::Request, shared_games: &SharedGames) {
     };
 
     let games = shared_games.lock().unwrap();
-    let result: Result<(), String> = match launch_req.source.as_str() {
-        "steam" => {
-            if let Some(game) = games.steam.iter().find(|g| g.appid == launch_req.id) {
-                let url = format!("steam://rungameid/{}", game.appid);
-                std::process::Command::new("cmd")
-                    .args(["/c", "start", "", &url])
-                    .spawn()
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            } else {
-                Err(format!("steam game '{}' not found", launch_req.id))
-            }
+    let steam_match = games
+        .steam
+        .iter()
+        .find(|g| steam_game_id(g) == launch_req.id);
+    let epic_match = games.epic.iter().find(|g| epic_game_id(g) == launch_req.id);
+    let gog_match = games.gog.iter().find(|g| gog_game_id(g) == launch_req.id);
+    let match_count = steam_match.is_some() as u8 + epic_match.is_some() as u8 + gog_match.is_some() as u8;
+
+    let result: Result<(), String> = if match_count == 0 {
+        Err(format!("game '{}' not found", launch_req.id))
+    } else if match_count > 1 {
+        Err(format!("game id '{}' is ambiguous across sources", launch_req.id))
+    } else if let Some(game) = steam_match {
+        if let Some(running) = crate::steam::get_running_steam_games()
+            .into_iter()
+            .find(|g| g.appid == game.appid)
+        {
+            crate::process::focus_window_by_pid(running.pid).map_err(|e| e.to_string())
+        } else {
+            let url = format!("steam://rungameid/{}", game.appid);
+            std::process::Command::new("cmd")
+                .args(["/c", "start", "", &url])
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
-        "epic" => {
-            if let Some(game) = games.epic.iter().find(|g| g.app_name == launch_req.id) {
-                crate::epic::launch_epic_game(game).map_err(|e| e.to_string())
-            } else {
-                Err(format!("epic game '{}' not found", launch_req.id))
-            }
+    } else if let Some(game) = epic_match {
+        if let Some(running) = crate::epic::get_running_epic_games()
+            .into_iter()
+            .find(|g| !game.app_name.is_empty() && g.app_name == game.app_name)
+        {
+            crate::process::focus_window_by_pid(running.pid).map_err(|e| e.to_string())
+        } else {
+            crate::epic::launch_epic_game(game).map_err(|e| e.to_string())
         }
-        "gog" => {
-            if let Some(game) = games.gog.iter().find(|g| g.source_key == launch_req.id) {
-                crate::gog::launch_gog_game(game).map_err(|e| e.to_string())
-            } else {
-                Err(format!("gog game '{}' not found", launch_req.id))
-            }
+    } else if let Some(game) = gog_match {
+        if let Some(running) = crate::gog::get_running_gog_games()
+            .into_iter()
+            .find(|g| g.source_key == game.source_key)
+        {
+            crate::process::focus_window_by_pid(running.pid).map_err(|e| e.to_string())
+        } else {
+            crate::gog::launch_gog_game(game).map_err(|e| e.to_string())
         }
-        other => Err(format!("unknown source '{other}', expected steam/epic/gog")),
+    } else {
+        Err("internal launch resolution error".to_string())
     };
     drop(games);
 
@@ -167,11 +278,7 @@ fn handle_launch(mut request: tiny_http::Request, shared_games: &SharedGames) {
 }
 
 fn handle_running_games(request: tiny_http::Request) {
-    let payload = RunningGamesPayload {
-        steam: crate::steam::get_running_steam_games(),
-        epic: crate::epic::get_running_epic_games(),
-        gog: crate::gog::get_running_gog_games(),
-    };
+    let payload = build_running_games_list();
     let content_type = Header::from_bytes("Content-Type", "application/json").unwrap();
     match serde_json::to_string(&payload) {
         Ok(json) => {
@@ -185,9 +292,25 @@ fn handle_running_games(request: tiny_http::Request) {
     }
 }
 
+fn handle_windows(request: tiny_http::Request) {
+    let windows = crate::process::get_all_windows();
+    let content_type = Header::from_bytes("Content-Type", "application/json").unwrap();
+    match serde_json::to_string(&windows) {
+        Ok(json) => {
+            let _ = request.respond(Response::from_string(json).with_header(content_type));
+        }
+        Err(e) => {
+            eprintln!("[webserver] /windows serialization error: {e}");
+            let _ = request
+                .respond(Response::from_string("Internal Server Error").with_status_code(500));
+        }
+    }
+}
+
 fn handle_games(request: tiny_http::Request, shared_games: &SharedGames) {
     let payload = shared_games.lock().unwrap().clone();
-    match serde_json::to_string(&payload) {
+    let games = build_games_list(&payload);
+    match serde_json::to_string(&games) {
         Ok(json) => {
             let content_type = Header::from_bytes("Content-Type", "application/json").unwrap();
             let _ = request.respond(Response::from_string(json).with_header(content_type));

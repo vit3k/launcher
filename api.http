@@ -6,9 +6,12 @@ POST http://localhost:7878/games/launch
 Content-Type: application/json
 
 {
-    "source": "gog",
-    "id": "HKLM\\1207658995_is1"
+    "id": "dc9d2e595d0e4650b35d659f90d41059"
 }
 
 ###
 GET http://localhost:7878/games/running
+
+###
+GET http://localhost:7878/windows
+
