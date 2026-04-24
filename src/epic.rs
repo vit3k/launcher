@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,6 +12,7 @@ pub struct EpicGame {
     pub install_location: String,
     pub launch_executable: String,
     pub manifest_path: String,
+    pub poster_url: Option<String>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -83,6 +85,11 @@ pub fn get_installed_epic_games() -> Vec<EpicGame> {
             Err(_) => continue,
         };
 
+        let manifest_json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => serde_json::Value::Null,
+        };
+
         if manifest.install_location.is_empty() {
             continue;
         }
@@ -93,6 +100,7 @@ pub fn get_installed_epic_games() -> Vec<EpicGame> {
             install_location: manifest.install_location,
             launch_executable: manifest.launch_executable,
             manifest_path: path.to_string_lossy().to_string(),
+            poster_url: extract_epic_portrait_url(&manifest_json),
         });
     }
 
@@ -105,9 +113,7 @@ pub fn launch_epic_game(game: &EpicGame) -> std::io::Result<()> {
             "com.epicgames.launcher://apps/{}?action=launch&silent=true",
             game.app_name
         );
-        let status = Command::new("cmd")
-            .args(["/c", "start", "", &uri])
-            .spawn();
+        let status = Command::new("explorer").arg(&uri).spawn();
         if status.is_ok() {
             return Ok(());
         }
@@ -132,6 +138,77 @@ fn is_epic_manifest_file(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("item"))
         .unwrap_or(false)
+}
+
+fn extract_epic_portrait_url(manifest_json: &serde_json::Value) -> Option<String> {
+    let mut candidates = Vec::new();
+    collect_epic_portrait_urls(manifest_json, false, &mut candidates);
+
+    let mut seen = HashSet::new();
+    candidates.retain(|u| seen.insert(u.clone()));
+    candidates.into_iter().next()
+}
+
+fn collect_epic_portrait_urls(value: &serde_json::Value, key_is_portrait_hint: bool, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let type_value = map
+                .get("type")
+                .or_else(|| map.get("Type"))
+                .and_then(|v| v.as_str());
+            let url_value = map
+                .get("url")
+                .or_else(|| map.get("Url"))
+                .or_else(|| map.get("src"))
+                .or_else(|| map.get("Src"))
+                .or_else(|| map.get("imageUrl"))
+                .or_else(|| map.get("ImageUrl"))
+                .and_then(|v| v.as_str());
+            if let (Some(t), Some(u)) = (type_value, url_value) {
+                if is_portrait_hint(t) && looks_like_image_url(u) {
+                    out.push(u.to_string());
+                }
+            }
+
+            for (k, v) in map {
+                let key_hint = key_is_portrait_hint || is_portrait_hint(k);
+                collect_epic_portrait_urls(v, key_hint, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_epic_portrait_urls(item, key_is_portrait_hint, out);
+            }
+        }
+        serde_json::Value::String(s) => {
+            if looks_like_image_url(s) && (key_is_portrait_hint || is_portrait_hint(s)) {
+                out.push(s.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_image_url(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && (lower.contains(".jpg")
+            || lower.contains(".jpeg")
+            || lower.contains(".png")
+            || lower.contains(".webp")
+            || lower.contains(".avif"))
+}
+
+fn is_portrait_hint(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("portrait")
+        || lower.contains("vertical")
+        || lower.contains("tall")
+        || lower.contains("poster")
+        || lower.contains("boxtall")
+        || lower.contains("600x900")
+        || lower.contains("900x1200")
+        || lower.contains("1200x1600")
 }
 
 pub fn get_running_epic_games() -> Vec<RunningEpicGame> {

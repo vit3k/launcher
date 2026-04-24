@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tiny_http::{Header, Response, Server};
@@ -7,6 +8,8 @@ use crate::gog::GogGame;
 use crate::steam::SteamGame;
 
 const BIND_ADDR: &str = "0.0.0.0:7878";
+static STEAM_POSTER_CACHE: std::sync::OnceLock<Mutex<HashMap<String, Option<String>>>> =
+    std::sync::OnceLock::new();
 
 #[derive(serde::Serialize, Default, Clone)]
 pub struct GamesPayload {
@@ -20,6 +23,7 @@ struct ApiGame {
     id: String,
     source: &'static str,
     name: String,
+    poster_url: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -121,6 +125,40 @@ fn gog_game_id(game: &GogGame) -> String {
     game.source_key.clone()
 }
 
+fn steam_poster_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    STEAM_POSTER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn steam_vertical_poster_candidates(appid: &str) -> [String; 4] {
+    [
+        format!("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{appid}/library_600x900.jpg"),
+        format!("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{appid}/library_600x900_2x.jpg"),
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"),
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900_2x.jpg"),
+    ]
+}
+
+fn url_exists(url: &str) -> bool {
+    ureq::get(url).call().is_ok()
+}
+
+fn steam_poster_url(appid: &str) -> Option<String> {
+    if let Ok(cache) = steam_poster_cache().lock() {
+        if let Some(cached) = cache.get(appid) {
+            return cached.clone();
+        }
+    }
+
+    // Keep posters portrait-only; do not fall back to horizontal header/capsule art.
+    let resolved = steam_vertical_poster_candidates(appid)
+        .into_iter()
+        .find(|url| url_exists(url));
+    if let Ok(mut cache) = steam_poster_cache().lock() {
+        cache.insert(appid.to_string(), resolved.clone());
+    }
+    resolved
+}
+
 fn build_games_list(payload: &GamesPayload) -> Vec<ApiGame> {
     let mut out = Vec::new();
 
@@ -129,6 +167,7 @@ fn build_games_list(payload: &GamesPayload) -> Vec<ApiGame> {
             id: steam_game_id(g),
             source: "steam",
             name: g.name.clone(),
+            poster_url: steam_poster_url(&g.appid),
         });
     }
 
@@ -137,6 +176,7 @@ fn build_games_list(payload: &GamesPayload) -> Vec<ApiGame> {
             id: epic_game_id(g),
             source: "epic",
             name: g.display_name.clone(),
+            poster_url: g.poster_url.clone(),
         });
     }
 
@@ -145,6 +185,7 @@ fn build_games_list(payload: &GamesPayload) -> Vec<ApiGame> {
             id: gog_game_id(g),
             source: "gog",
             name: g.display_name.clone(),
+            poster_url: None,
         });
     }
 
